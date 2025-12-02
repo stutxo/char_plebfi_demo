@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<script src="https://unpkg.com/nostr-tools/lib/nostr.bundle.js"></script>
+<style>
+    body { font-family: sans-serif; text-align: center; padding-top: 10vh; }
+    input, button { font-size: 1.0rem; padding: 15px; margin: 10px; display: block; width: 90%; max-width: 400px; margin-inline: auto; }
+</style>
+
+<h4>charter 📜</h4>
+
+<div id="loginSection">
+    <button onclick="login()">Login with Nostr Extension</button>
+</div>
+
+<div id="appSection" hidden>
+    <div>Logged in as: <code id="pubDisp"></code></div>
+    <input id="ipIn" placeholder="Enter IP address">
+    <button id="btn" onclick="pub()">submit new A record</button>
+    <div id="log"></div>
+</div>
+
+<script>
+    let pk;
+    const { SimplePool, nip19 } = NostrTools;
+    const relays = ['wss://relay.damus.io', 'wss://nostr.wine', 'wss://nos.lol'];
+
+    const login = async () => {
+        if (!window.nostr) return alert("No NIP-07 extension found!");
+        try {
+            pk = await window.nostr.getPublicKey();
+            pubDisp.innerText = nip19.npubEncode(pk);
+            loginSection.hidden = true;
+            appSection.hidden = false;
+        } catch (e) { alert("Login failed"); }
+    };
+
+    const pub = async () => {
+        if (!/^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/.test(ipIn.value))
+            return log.innerText = "Invalid IPv4";
+
+        btn.disabled = true;
+        log.innerText = "Signing and Publishing...";
+
+        try {
+            const ev = await window.nostr.signEvent({
+                kind: 60067, created_at: Math.floor(Date.now()/1000), tags: [], content: ipIn.value, pubkey: pk
+            });
+            console.log("Signed event JSON:", JSON.stringify(ev));
+            const pool = new SimplePool();
+            await Promise.any(pool.publish(relays, ev));
+            log.innerText = `DNS A record update sent, ID: ${ev.id}`;
+            pool.close(relays);
+        } catch (e) { log.innerText = "Error: " + e; }
+        finally { btn.disabled = false; }
+    };
+</script>
