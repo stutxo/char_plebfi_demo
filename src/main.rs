@@ -1,21 +1,22 @@
 use std::collections::HashSet;
+use std::error::Error as StdError;
+use std::io::Read;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::thread;
+use std::sync::{Arc, Mutex};
 
+use char_sdk::{
+    BitcoindAsyncTransport, CharBallotHandlers, CharRpcTransport, DomainId, ReconcileRequest,
+    TransportError,
+};
 use clap::Parser;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, mpsc};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::char_rpc::{CharRpc, decode_leader_payload, domain_to_char_hash};
 use crate::dns::update_a_record;
 
-mod char_rpc;
 mod dns;
 
 const BALLOT_FILENAME: &str = "ballot.dat";
@@ -23,8 +24,6 @@ const NOSTR_KIND: Kind = Kind::Custom(60067);
 
 #[derive(Parser, Debug)]
 struct Cli {
-    #[arg(long)]
-    zmq: String,
     #[arg(long)]
     bitcoinrpc: String,
     #[arg(long)]
@@ -40,48 +39,114 @@ async fn main() {
     let dns_api_key = std::env::var("PDNS_API_KEY").expect("PDNS_API_KEY not set");
     let ballot_path = Path::new(&args.datadir).join(BALLOT_FILENAME);
 
+    let last_ballot = load_ballot_num_from_disk(&ballot_path);
+    info!("Starting Charter with last ballot number: {}", last_ballot);
+
+    let cookie_path = Path::new(&args.datadir).join(".cookie");
+
     // 1. Connect to Char RPC
-    let rpc = CharRpc::new(&args.datadir, &args.bitcoinrpc).unwrap();
-    if !rpc.check_for_active_bonds().await.unwrap_or(false) {
-        error!("No active bonds detected or wallet loaded, exiting.");
-        return;
-    }
+    let char_rpc =
+        BitcoindAsyncTransport::from_cookie_file(&args.bitcoinrpc, &cookie_path).unwrap();
+    // See if there is a bond loaded in wallet
+    let bond = match char_rpc.get_all_char_bonds(0).await {
+        Ok(bonds) if bonds.is_empty() => {
+            error!("No active bonds detected or wallet loaded, exiting.");
+            return;
+        }
+        Err(e) => {
+            error!("Failed to get bonds: {:?}", e);
+            return;
+        }
+        Ok(bonds) => bonds.into_iter().next().unwrap(),
+    };
 
     // 2. Compute the app key for the char_dns app
     let kv_key_hex = hex::encode(Sha256::digest(b"char_dns"));
     info!("char dns key hex: {}", kv_key_hex);
 
-    let target_app = domain_to_char_hash(&kv_key_hex).expect("Hash failed");
+    let target_app = DomainId::from_preimage_hex(&kv_key_hex).unwrap();
+
+    match char_rpc
+        .domain_registry_schedule(&kv_key_hex, "char_dns")
+        .await
+    {
+        Ok(result) if result.success => {
+            info!("Scheduled char_dns domain in the node registry.");
+        }
+        Ok(_) => {
+            error!("Scheduling char_dns domain returned success=false.");
+            return;
+        }
+        Err(e) => {
+            error!("Failed to schedule char_dns domain: {:?}", e);
+            return;
+        }
+    }
+
+    let domain_tip = match char_rpc.get_domain_info(&kv_key_hex).await {
+        Ok(info) => Some(info.tip_height),
+        Err(e) if is_empty_domain_error(&e) => {
+            if last_ballot == 0 {
+                info!("No decided ballots yet for this domain. Skipping startup reconcile.");
+            } else {
+                warn!(
+                    "Domain has no decided ballots yet, but local state is at ballot {}. Continuing without reconcile.",
+                    last_ballot
+                );
+            }
+            None
+        }
+        Err(e) => {
+            error!("Failed to get domain info: {:?}", e);
+            return;
+        }
+    };
+
+    if let Some(domain_tip) = domain_tip {
+        let reconcile_result = char_sdk::reconcile(
+            &char_rpc,
+            &kv_key_hex,
+            ReconcileRequest {
+                domain: target_app,
+                from_ballot: last_ballot,
+                to_ballot: domain_tip,
+                max_fetch: 100,
+            },
+        )
+        .await;
+        match reconcile_result {
+            Ok(result) => {
+                info!("Reconcile completed. Next ballot: {}", result.next_ballot);
+                save_ballot_num_to_disk(&ballot_path, result.next_ballot);
+            }
+            Err(e) => error!("Reconcile failed: {:?}", e),
+        }
+    }
     let nostr_pool: NostrPool = Arc::new(Mutex::new(Vec::new()));
-    let (tx, rx) = mpsc::channel(100);
 
     // 3. Listen for dns events from nostr
     let nostr_task = tokio::spawn(nostr_task(nostr_pool.clone()));
 
-    let zmq_args = args.zmq.clone();
-    // 4. Wait for leader notifications over ZMQ to data in nostr pool
-    thread::spawn(move || zmq_task(&zmq_args, target_app, tx));
-
-    // 5. When leader, submit data from nostr pool to char via add_bamboo_kv rpc
-    let leader_task = tokio::spawn(leader_task(
-        rpc.clone(),
-        kv_key_hex.clone(),
+    let mut app = Charter::new(
         nostr_pool.clone(),
-        rx,
-    ));
+        Path::new(&args.datadir).join(BALLOT_FILENAME),
+        dns_api_key,
+    );
 
-    // 6. Find decision rolls, processs any dns events found
-    let roll_task = tokio::spawn(roll_task(
-        rpc.clone(),
-        kv_key_hex,
-        nostr_pool.clone(),
-        ballot_path,
-        dns_api_key.clone(),
-    ));
-
-    if let Err(e) = tokio::try_join!(leader_task, roll_task, nostr_task) {
-        error!("Task exited unexpectedly: {:?}", e);
+    //4. Run the ZMQ char daemon to participate in char consensus and submit votes
+    if let Err(e) = char_sdk::run_zmq(
+        &char_rpc,
+        kv_key_hex.as_str(),
+        target_app,
+        &bond.txid,
+        &mut app,
+    )
+    .await
+    {
+        error!("ZMQ task failed: {:?}", e);
     }
+
+    let _ = nostr_task.await;
 }
 
 async fn nostr_task(nostr_pool: NostrPool) {
@@ -104,7 +169,9 @@ async fn nostr_task(nostr_pool: NostrPool) {
             {
                 if subscription_id == sub_id {
                     info!("Nostr event received: {}", event.id);
-                    nostr_pool.lock().await.push(event.as_json());
+                    if let Ok(mut pool) = nostr_pool.lock() {
+                        pool.push(event.as_json());
+                    }
                 }
             }
             Ok(false)
@@ -113,50 +180,30 @@ async fn nostr_task(nostr_pool: NostrPool) {
         .unwrap();
 }
 
-// Char needs to be build with `cmake -DWITH_ZMQ=ON -B build`, `zmqpubleader=tcp://127.0.0.1:28332` and app scheduled with
-// bitcoin-cli config_app_registry_schedule 17f24e073d4eb05ef1779b2ea4c9895e7ad0d25e08d188ef5818aa9e1112f5ef true
-fn zmq_task(endpoint: &str, target_app: [u8; 32], tx: mpsc::Sender<(u64, Vec<u8>)>) {
-    let ctx = zmq::Context::new();
-    let socket = ctx.socket(zmq::SUB).expect("ZMQ socket failed");
-    socket.connect(endpoint).expect("ZMQ connect failed");
-    socket
-        .set_subscribe(b"leader")
-        .expect("ZMQ subscribe failed");
+pub struct Charter {
+    nostr_pool: NostrPool,
+    ballot_path: PathBuf,
+    dns_api_key: String,
+}
 
-    info!("[ZMQ] Listening...");
-    loop {
-        if let Ok(Ok(topic)) = socket.recv_string(0) {
-            if topic == "leader" {
-                if let Ok(payload) = socket.recv_bytes(0) {
-                    let _ = socket.recv_bytes(0); // seq
-                    if let Ok((ballot, domain)) = decode_leader_payload(&payload) {
-                        if domain == target_app {
-                            let _ = tx.blocking_send((ballot, domain.to_vec()));
-                        }
-                    }
-                }
-            }
+impl Charter {
+    pub fn new(nostr_pool: NostrPool, ballot_path: PathBuf, dns_api_key: String) -> Self {
+        Self {
+            nostr_pool,
+            ballot_path,
+            dns_api_key,
         }
     }
 }
 
-async fn leader_task(
-    rpc: CharRpc,
-    key_hex: String,
-    nostr_pool: NostrPool,
-    mut rx: mpsc::Receiver<(u64, Vec<u8>)>,
-) {
-    info!("Waiting for ZMQ events...");
-    let mut last_ballot = None;
-
-    while let Some((ballot, _)) = rx.recv().await {
-        if last_ballot == Some(ballot) {
-            continue;
-        }
-        last_ballot = Some(ballot);
+impl CharBallotHandlers for Charter {
+    fn produce_payload(&mut self, ballot: u64) -> Vec<u8> {
+        info!("Waiting for ZMQ events...");
 
         let mut events = Vec::new();
-        std::mem::swap(&mut *nostr_pool.lock().await, &mut events);
+        if let Ok(mut pool) = self.nostr_pool.lock() {
+            std::mem::swap(&mut *pool, &mut events);
+        }
 
         info!(
             "You are the leader for ballot {}, Submitting vote with {} events",
@@ -171,67 +218,55 @@ async fn leader_task(
                 }
             }
         }
-        if let Err(e) = rpc.add_bamboo_kv(key_hex.clone(), events, ballot).await {
-            error!("Failed to send KV: {:?}", e);
-        }
-        info!("Waiting for next leader election...");
+        serde_json::to_vec(&events).unwrap_or_default()
     }
-}
 
-async fn roll_task(
-    rpc: CharRpc,
-    key_hex: String,
-    nostr_pool: NostrPool,
-    ballot_path: PathBuf,
-    dns_api_key: String,
-) {
-    let mut ballot = load_ballot_num_from_disk(&ballot_path).await;
-    info!("[INIT] Resuming from ballot: {}", ballot);
+    fn on_roll_observed(
+        &mut self,
+        ballot: u64,
+        payload: &[u8],
+    ) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        let json: serde_json::Value = serde_json::from_slice(payload)?;
+        let events_arr = json.as_array();
 
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if events_arr.map_or(true, |a| a.is_empty()) {
+            save_ballot_num_to_disk(&self.ballot_path, ballot + 1);
+            return Ok(());
+        }
 
-        match rpc.get_referendum_decision_roll(&key_hex, ballot).await {
-            Ok(Some(json)) => {
-                let events_arr = json.as_array();
-                if events_arr.map_or(true, |a| a.is_empty()) {
-                    // Write ballot to disk so we can start up again from here
-                    ballot = save_ballot_num_to_disk(&ballot_path, ballot + 1).await;
-                    continue;
-                }
+        info!("[ROLL] Decision roll found for ballot: {}", ballot);
 
-                info!("[ROLL] Decision roll found for ballot: {}", ballot);
+        let events: Vec<Event> = events_arr
+            .unwrap()
+            .iter()
+            .filter_map(|i| {
+                i.as_str()
+                    .and_then(|s| serde_json::from_str::<Event>(s).ok())
+            })
+            .collect();
 
-                let events: Vec<Event> = events_arr
-                    .unwrap()
-                    .iter()
-                    .filter_map(|i| i.as_str().and_then(|s| serde_json::from_str(s).ok()))
-                    .collect();
+        let ids: HashSet<_> = events.iter().map(|e| e.id.to_string()).collect();
 
-                let ids: HashSet<_> = events.iter().map(|e| e.id.to_string()).collect();
-                if !ids.is_empty() {
-                    let mut p = nostr_pool.lock().await;
-                    // Remove any events from our nostr pool that have been processed by this decision roll
-                    p.retain(|s| {
-                        serde_json::from_str::<Event>(s)
-                            .map_or(true, |e| !ids.contains(&e.id.to_string()))
-                    });
-                }
-
-                // Add records to DNS
-                for event in events {
-                    process_dns_event(&event, &dns_api_key).await;
-                }
-
-                ballot = save_ballot_num_to_disk(&ballot_path, ballot + 1).await;
+        if !ids.is_empty() {
+            if let Ok(mut pool) = self.nostr_pool.lock() {
+                pool.retain(|s| {
+                    serde_json::from_str::<Event>(s)
+                        .map_or(true, |e| !ids.contains(&e.id.to_string()))
+                });
             }
-            Ok(None) => {}
-            Err(e) => error!("RPC Error on ballot {}: {:?}", ballot, e),
         }
+
+        for event in events {
+            process_dns_event(&event, &self.dns_api_key);
+        }
+
+        save_ballot_num_to_disk(&self.ballot_path, ballot + 1);
+
+        Ok(())
     }
 }
 
-async fn process_dns_event(event: &Event, dns_api_key: &str) {
+fn process_dns_event(event: &Event, dns_api_key: &str) {
     // verify signature for nostr note
     if event.verify().is_err() {
         return error!("[DNS] Skip {}: Invalid Sig", event.id);
@@ -239,8 +274,11 @@ async fn process_dns_event(event: &Event, dns_api_key: &str) {
     match (Ipv4Addr::from_str(&event.content), event.pubkey.to_bech32()) {
         (Ok(ip), Ok(label)) => {
             info!("[DNS] Updating key: {} with ip: {}", label, ip);
-            // update the A record for the requested npub, using the provided IP
-            if let Err(e) = update_a_record(&label, &ip.to_string(), &dns_api_key).await {
+            // reqwest::blocking must run in Tokio's blocking section when invoked from the ZMQ runtime.
+            let update_result = tokio::task::block_in_place(|| {
+                update_a_record(&label, &ip.to_string(), dns_api_key)
+            });
+            if let Err(e) = update_result {
                 error!("Failed to update A record: {:?}", e);
             }
         }
@@ -248,19 +286,50 @@ async fn process_dns_event(event: &Event, dns_api_key: &str) {
     }
 }
 
-async fn load_ballot_num_from_disk(path: &Path) -> u64 {
-    if let Ok(mut f) = tokio::fs::File::open(path).await {
+fn load_ballot_num_from_disk(path: &Path) -> u64 {
+    if let Ok(mut f) = std::fs::File::open(path) {
         let mut buf = [0u8; 8];
-        if f.read_exact(&mut buf).await.is_ok() {
+        if f.read_exact(&mut buf).is_ok() {
             return u64::from_le_bytes(buf);
         }
     }
     0
 }
 
-async fn save_ballot_num_to_disk(path: &Path, num: u64) -> u64 {
-    if let Err(e) = tokio::fs::write(path, num.to_le_bytes()).await {
+fn save_ballot_num_to_disk(path: &Path, num: u64) -> u64 {
+    if let Err(e) = std::fs::write(path, num.to_le_bytes()) {
         error!("[DISK] Failed to save ballot: {:?}", e);
     }
     num
+}
+
+fn is_empty_domain_error(err: &TransportError) -> bool {
+    matches!(
+        err,
+        TransportError::Rpc { code: -1, message }
+            if message == "No decided ballots for this domain"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_empty_domain_rpc_error() {
+        let err = TransportError::Rpc {
+            code: -1,
+            message: "No decided ballots for this domain".into(),
+        };
+        assert!(is_empty_domain_error(&err));
+    }
+
+    #[test]
+    fn ignores_other_transport_errors() {
+        let err = TransportError::Rpc {
+            code: -1,
+            message: "some other rpc error".into(),
+        };
+        assert!(!is_empty_domain_error(&err));
+    }
 }

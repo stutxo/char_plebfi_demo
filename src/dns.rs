@@ -1,11 +1,11 @@
-use reqwest::Client;
+use reqwest::blocking::Client;
 use serde_json::json;
 
 const PDNS_BASE_URL: &str = "http://127.0.0.1:8081/api/v1";
 const PDNS_SERVER_ID: &str = "localhost";
 const ZONE_NAME: &str = "nostr.";
 
-pub async fn update_a_record(
+pub fn update_a_record(
     label: &str,
     ip: &str,
     api_key: &str,
@@ -38,16 +38,15 @@ pub async fn update_a_record(
         ]
     });
 
-    let resp: reqwest::Response = client
+    let resp: reqwest::blocking::Response = client
         .patch(&url)
         .header("X-API-Key", api_key)
         .json(&body)
-        .send()
-        .await?;
+        .send()?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await?;
+        let text = resp.text()?;
         eprintln!("PowerDNS error: HTTP {}: {}", status, text);
         return Err(format!("PDNS API request failed: {}", status).into());
     }
