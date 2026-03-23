@@ -1,9 +1,10 @@
 #!/bin/bash
-set -u
+set -euo pipefail
 
 SESSION="char_demo"
 DATA_DIR="/Users/stu/char"
 BITCOIN_BIN="${DATA_DIR}/char-bitcoin/build/bin"
+WALLET_NAME="char"
 
 # --- CONFIGURATION ---
 CHAR_DNS_APP_ID="17f24e073d4eb05ef1779b2ea4c9895e7ad0d25e08d188ef5818aa9e1112f5ef"
@@ -33,6 +34,46 @@ cli() {
   local rpcport="$1"; shift
   local datadir="$1"; shift
   "${BITCOIN_BIN}/bitcoin-cli" -regtest -rpcport="${rpcport}" -datadir="${datadir}" "$@"
+}
+
+wallet_cli() {
+  local rpcport="$1"; shift
+  local datadir="$1"; shift
+  "${BITCOIN_BIN}/bitcoin-cli" -regtest -rpcwallet="${WALLET_NAME}" -rpcport="${rpcport}" -datadir="${datadir}" "$@"
+}
+
+create_bond_with_stake() {
+    local rpc_port="$1"
+    local data_dir="$2"
+    local mining_addr="$3"
+
+    local bond_out
+    local bond_txid
+    local bonds_json
+    local staked_amount
+
+    bond_out=$(wallet_cli "$rpc_port" "$data_dir" walletcreatetaprootoutputforcharbond)
+    bond_txid=$(echo "$bond_out" | sed -n 's/.*"txid"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p')
+    if [[ -z "$bond_txid" || ${#bond_txid} -ne 64 ]]; then
+        error "Failed to parse bond txid for node on RPC port ${rpc_port}"
+        echo "$bond_out"
+        exit 1
+    fi
+
+    wallet_cli "$rpc_port" "$data_dir" fundcharstake "$bond_txid" 0.1 1008 >/dev/null
+    cli "$rpc_port" "$data_dir" generatetoaddress 7 "$mining_addr" >/dev/null
+    wait_for_sync
+
+    bonds_json=$(wallet_cli "$rpc_port" "$data_dir" getallcharbonds 0)
+    staked_amount=$(echo "$bonds_json" | sed -n "/\"txid\"[[:space:]]*:[[:space:]]*\"${bond_txid}\"/,/}/ s/.*\"amount\"[[:space:]]*:[[:space:]]*\\([0-9.]*\\).*/\\1/p" | head -1)
+
+    if [[ -z "$staked_amount" || "$staked_amount" == "0.00000000" ]]; then
+        error "Bond ${bond_txid} on RPC port ${rpc_port} has no active stake after funding."
+        echo "$bonds_json"
+        exit 1
+    fi
+
+    log "Bond ${bond_txid} active on RPC port ${rpc_port} with amount ${staked_amount}"
 }
 
 setup_node_pane() {
@@ -98,7 +139,7 @@ log "Cleaning up..."
 tmux kill-session -t "${SESSION}" 2>/dev/null || true
 PORTS_TO_CLEAR=($NODE1_RPC $NODE2_RPC $NODE3_RPC $NODE1_P2P $NODE2_P2P $NODE3_P2P)
 for port in "${PORTS_TO_CLEAR[@]}"; do
-    pid=$(lsof -ti :$port 2>/dev/null)
+    pid=$(lsof -ti :"$port" 2>/dev/null || true)
     if [ ! -z "$pid" ]; then kill -9 $pid 2>/dev/null || true; fi
 done
 sleep 2
@@ -118,15 +159,15 @@ tmux split-window -h -p 50 -t 4
 log "Starting Nodes (Daemon Mode)..."
 
 # --- NODE 1 ---
-CMD1="${BITCOIN_BIN}/bitcoind ${BITCOIND_COMMON} -datadir='${NODE1_DIR}' -port=${NODE1_P2P} -rpcport=${NODE1_RPC} -zmqpubleader='${ZMQ1}' -daemon"
+CMD1="${BITCOIN_BIN}/bitcoind ${BITCOIND_COMMON} -datadir='${NODE1_DIR}' -port=${NODE1_P2P} -rpcport=${NODE1_RPC} -zmqpubleader='${ZMQ1}' -zmqpubdecisionroll='${ZMQ1}' -daemon"
 setup_node_pane "0" "Node 1" "$CMD1" "$NODE1_RPC" "$NODE1_DIR"
 
 # --- NODE 2 ---
-CMD2="${BITCOIN_BIN}/bitcoind ${BITCOIND_COMMON} -datadir='${NODE2_DIR}' -port=${NODE2_P2P} -rpcport=${NODE2_RPC} -zmqpubleader='${ZMQ2}' -daemon"
+CMD2="${BITCOIN_BIN}/bitcoind ${BITCOIND_COMMON} -datadir='${NODE2_DIR}' -port=${NODE2_P2P} -rpcport=${NODE2_RPC} -zmqpubleader='${ZMQ2}' -zmqpubdecisionroll='${ZMQ2}' -daemon"
 setup_node_pane "1" "Node 2" "$CMD2" "$NODE2_RPC" "$NODE2_DIR"
 
 # --- NODE 3 ---
-CMD3="${BITCOIN_BIN}/bitcoind ${BITCOIND_COMMON} -datadir='${NODE3_DIR}' -port=${NODE3_P2P} -rpcport=${NODE3_RPC} -zmqpubleader='${ZMQ3}' -daemon"
+CMD3="${BITCOIN_BIN}/bitcoind ${BITCOIND_COMMON} -datadir='${NODE3_DIR}' -port=${NODE3_P2P} -rpcport=${NODE3_RPC} -zmqpubleader='${ZMQ3}' -zmqpubdecisionroll='${ZMQ3}' -daemon"
 setup_node_pane "2" "Node 3" "$CMD3" "$NODE3_RPC" "$NODE3_DIR"
 
 
@@ -134,8 +175,8 @@ setup_node_pane "2" "Node 3" "$CMD3" "$NODE3_RPC" "$NODE3_DIR"
 log "Establishing Wallets..."
 for node in "$NODE1_RPC $NODE1_DIR" "$NODE2_RPC $NODE2_DIR" "$NODE3_RPC $NODE3_DIR"; do
     read -r port dir <<< "$node"
-    if ! cli "$port" "$dir" getwalletinfo >/dev/null 2>&1; then
-        cli "$port" "$dir" createwallet "char" >/dev/null
+    if ! wallet_cli "$port" "$dir" getwalletinfo >/dev/null 2>&1; then
+        cli "$port" "$dir" createwallet "${WALLET_NAME}" >/dev/null
     fi
 done
 
@@ -154,47 +195,38 @@ fi
 log "P2P connections confirmed."
 
 log "Mining initial blocks..."
-ADDR1=$(cli "${NODE1_RPC}" "${NODE1_DIR}" getnewaddress)
+ADDR1=$(wallet_cli "${NODE1_RPC}" "${NODE1_DIR}" getnewaddress)
 cli "${NODE1_RPC}" "${NODE1_DIR}" generatetoaddress 101 "${ADDR1}" >/dev/null
 wait_for_sync
 
-ADDR2=$(cli "${NODE2_RPC}" "${NODE2_DIR}" getnewaddress)
+ADDR2=$(wallet_cli "${NODE2_RPC}" "${NODE2_DIR}" getnewaddress)
 cli "${NODE2_RPC}" "${NODE2_DIR}" generatetoaddress 101 "${ADDR2}" >/dev/null
 wait_for_sync
 
-ADDR3=$(cli "${NODE3_RPC}" "${NODE3_DIR}" getnewaddress)
+ADDR3=$(wallet_cli "${NODE3_RPC}" "${NODE3_DIR}" getnewaddress)
 cli "${NODE3_RPC}" "${NODE3_DIR}" generatetoaddress 101 "${ADDR3}" >/dev/null
 wait_for_sync
 
-log "Block Height: 303. Registering Apps..."
+log "Block Height: 303."
 
+log "Creating Bonds..."
+create_bond_with_stake "${NODE1_RPC}" "${NODE1_DIR}" "${ADDR1}"
+create_bond_with_stake "${NODE2_RPC}" "${NODE2_DIR}" "${ADDR2}"
+create_bond_with_stake "${NODE3_RPC}" "${NODE3_DIR}" "${ADDR3}"
+
+log "Scheduling domain..."
 for node in "$NODE1_RPC $NODE1_DIR" "$NODE2_RPC $NODE2_DIR" "$NODE3_RPC $NODE3_DIR"; do
     read -r port dir <<< "$node"
-    cli "$port" "$dir" add_app_to_app_registry "${CHAR_DNS_APP_ID}" "char_dns"
-    cli "$port" "$dir" config_app_registry_schedule "${CHAR_DNS_APP_ID}" true
+    cli "$port" "$dir" domain_registry schedule "${CHAR_DNS_APP_ID}" "char_dns" >/dev/null
 done
 
 cli "${NODE1_RPC}" "${NODE1_DIR}" generatetoaddress 1 "${ADDR1}" >/dev/null
 wait_for_sync
 
-log "Creating Bonds..."
-# Node 1
-cli "${NODE1_RPC}" "${NODE1_DIR}" walletcreatetaprootoutputforcharbond 1
-cli "${NODE1_RPC}" "${NODE1_DIR}" generatetoaddress 7 "${ADDR1}" >/dev/null
-wait_for_sync
-# Node 2
-cli "${NODE2_RPC}" "${NODE2_DIR}" walletcreatetaprootoutputforcharbond 1
-cli "${NODE2_RPC}" "${NODE2_DIR}" generatetoaddress 7 "${ADDR2}" >/dev/null
-wait_for_sync
-# Node 3
-cli "${NODE3_RPC}" "${NODE3_DIR}" walletcreatetaprootoutputforcharbond 1
-cli "${NODE3_RPC}" "${NODE3_DIR}" generatetoaddress 7 "${ADDR3}" >/dev/null
-wait_for_sync
-
 log "Starting Daemons..."
-tmux send-keys -t 3 "export PDNS_API_KEY='supersecretkey'; cargo run -- --zmq '${ZMQ1}' --bitcoinrpc 'http://127.0.0.1:${NODE1_RPC}' --datadir '${NODE1_DIR}/regtest'" C-m
-tmux send-keys -t 4 "export PDNS_API_KEY='supersecretkey'; cargo run -- --zmq '${ZMQ2}' --bitcoinrpc 'http://127.0.0.1:${NODE2_RPC}' --datadir '${NODE2_DIR}/regtest'" C-m
-tmux send-keys -t 5 "export PDNS_API_KEY='supersecretkey'; cargo run -- --zmq '${ZMQ3}' --bitcoinrpc 'http://127.0.0.1:${NODE3_RPC}' --datadir '${NODE3_DIR}/regtest'" C-m
+tmux send-keys -t 3 "export PDNS_API_KEY='supersecretkey'; export CHAR_ZMQ_LEADER_ADDR='${ZMQ1}'; export CHAR_ZMQ_DECISIONROLL_ADDR='${ZMQ1}'; cargo run -- --bitcoinrpc 'http://127.0.0.1:${NODE1_RPC}' --datadir '${NODE1_DIR}/regtest'" C-m
+tmux send-keys -t 4 "export PDNS_API_KEY='supersecretkey'; export CHAR_ZMQ_LEADER_ADDR='${ZMQ2}'; export CHAR_ZMQ_DECISIONROLL_ADDR='${ZMQ2}'; cargo run -- --bitcoinrpc 'http://127.0.0.1:${NODE2_RPC}' --datadir '${NODE2_DIR}/regtest'" C-m
+tmux send-keys -t 5 "export PDNS_API_KEY='supersecretkey'; export CHAR_ZMQ_LEADER_ADDR='${ZMQ3}'; export CHAR_ZMQ_DECISIONROLL_ADDR='${ZMQ3}'; cargo run -- --bitcoinrpc 'http://127.0.0.1:${NODE3_RPC}' --datadir '${NODE3_DIR}/regtest'" C-m
 
 log "Setup Complete! Attaching..."
 tmux attach -t "${SESSION}"

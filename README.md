@@ -82,6 +82,22 @@ bitcoin-cli add_app_to_app_registry 17f24e073d4eb05ef1779b2ea4c9895e7ad0d25e08d1
 bitcoin-cli config_app_registry_schedule 17f24e073d4eb05ef1779b2ea4c9895e7ad0d25e08d188ef5818aa9e1112f5ef true
 ```
 
+### 6. Start Charter frontend
+
+From the directory containing `index.html`, start a simple local web server:
+
+```bash
+# Serve the frontend on http://127.0.0.1:8000
+cd <path_to_frontend>
+python3 -m http.server 8000
+```
+
+Then open:
+
+- `http://127.0.0.1:8000`
+
+> **Note:** Use `Ctrl+C` to stop the server.
+
 
 ### PowerDNS setup on macOS (Homebrew + SQLite backend)
 
@@ -155,3 +171,4 @@ bitcoin-cli config_app_registry_schedule 17f24e073d4eb05ef1779b2ea4c9895e7ad0d25
 
 
 ---
+
